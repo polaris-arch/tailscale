@@ -6,6 +6,7 @@
 package ipnlocal
 
 import (
+	"github.com/sagernet/tailscale/util/dirscope"
 	"bufio"
 	"cmp"
 	"context"
@@ -242,6 +243,7 @@ type LocalBackend struct {
 	pushDeviceToken          syncs.AtomicValue[string]
 	backendLogID             logid.PublicID // or zero value if logging not in use
 	unregisterSysPolicyWatch func()
+	directoryScope           *dirscope.Scope // immutable, bound before extension initialization
 	varRoot                  string         // or empty if SetVarRoot never called
 	logFlushFunc             func()         // or nil if SetLogFlusher wasn't called
 	em                       *expiryManager // non-nil; TODO(nickkhyl): move to nodeBackend
@@ -547,7 +549,14 @@ type clientGen func(controlclient.Options) (controlclient.Client, error)
 // If dialer is nil, a new one is made.
 //
 // The logID may be the zero value if logging is not in use.
-func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, loginFlags controlclient.LoginFlags, lookupHook dnscache.LookupHookFunc, onlyTCP443 bool) (_ *LocalBackend, err error) {
+func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, loginFlags controlclient.LoginFlags, lookupHook dnscache.LookupHookFunc, onlyTCP443 bool, directoryScopes ...*dirscope.Scope) (_ *LocalBackend, err error) {
+	var directoryScope *dirscope.Scope
+	if len(directoryScopes) > 1 {
+		return nil, errors.New("multiple directory scopes")
+	}
+	if len(directoryScopes) == 1 {
+		directoryScope = directoryScopes[0]
+	}
 	e := sys.Engine.Get()
 	store := sys.StateStore.Get()
 	dialer := sys.Dialer.Get()
@@ -594,6 +603,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	}
 
 	b := &LocalBackend{
+		directoryScope: directoryScope,
 		ctx:          ctx,
 		ctxCancel:    cancel,
 		logf:         logf,
@@ -3039,6 +3049,9 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 }
 
 func (b *LocalBackend) startLocked(opts ipn.Options) error {
+	release, scopeErr := b.directoryScope.Begin()
+	if scopeErr != nil { return scopeErr }
+	defer release()
 	b.logf("Start")
 	logf := logger.WithPrefix(b.logf, "Start: ")
 	b.startOnce.Do(b.initOnce)
@@ -3059,11 +3072,11 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 	if b.state != ipn.Running && b.conf != nil && b.conf.Parsed.AuthKey != nil && opts.AuthKey == "" {
 		v := *b.conf.Parsed.AuthKey
 		if filename, ok := strings.CutPrefix(v, "file:"); ok {
-			b, err := os.ReadFile(filename)
+			authKeyBytes, err := b.directoryScope.ReadFile(filename)
 			if err != nil {
 				return fmt.Errorf("error reading config file authKey: %w", err)
 			}
-			v = strings.TrimSpace(string(b))
+			v = strings.TrimSpace(string(authKeyBytes))
 		}
 		opts.AuthKey = v
 	}
@@ -6255,6 +6268,10 @@ func (b *LocalBackend) SetTCPHandlerForFunnelFlow(h func(src netip.AddrPort, dst
 // storage area . (e.g. "/var/lib/tailscale")
 //
 // It should only be called before the LocalBackend is used.
+// DirectoryScope returns the immutable filesystem capability, not a goroutine
+// shutdown promise. Nil is the legacy untracked mode and cannot prove retirement.
+func (b *LocalBackend) DirectoryScope() *dirscope.Scope { return b.directoryScope }
+
 func (b *LocalBackend) SetVarRoot(dir string) {
 	b.varRoot = dir
 }
@@ -6338,6 +6355,9 @@ func (b *LocalBackend) profileDataPathLocked(id ipn.ProfileID, subs ...string) s
 // profileMkdirAllLocked implements ProfileMkdirAll.
 // The caller must hold b.mu.
 func (b *LocalBackend) profileMkdirAllLocked(id ipn.ProfileID, subs ...string) (string, error) {
+	release, err := b.directoryScope.Begin()
+	if err != nil { return "", err }
+	defer release()
 	if id == "" {
 		return "", errProfileNotFound
 	}
@@ -8341,6 +8361,9 @@ func (b *LocalBackend) resetForProfileChangeLocked() error {
 // DeleteProfile deletes a profile with the given ID.
 // If the profile is not known, it is a no-op.
 func (b *LocalBackend) DeleteProfile(p ipn.ProfileID) error {
+	release, err := b.directoryScope.Begin()
+	if err != nil { return err }
+	defer release()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

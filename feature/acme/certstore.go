@@ -33,6 +33,7 @@ import (
 	"github.com/sagernet/tailscale/ipn/store/mem"
 	"github.com/sagernet/tailscale/net/bakedroots"
 	xacme "github.com/sagernet/tailscale/tempfork/acme"
+	"github.com/sagernet/tailscale/util/dirscope"
 	"github.com/sagernet/tailscale/util/testenv"
 	"github.com/sagernet/tailscale/version"
 	"github.com/sagernet/tailscale/version/distro"
@@ -62,6 +63,11 @@ var testX509Roots *x509.CertPool // set non-nil by tests
 // certDir returns (creating if needed) the directory in which cached
 // cert keypairs are stored.
 func certDir(b *ipnlocal.LocalBackend) (string, error) {
+	release, err := b.DirectoryScope().Begin()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	d := b.TailscaleVarRoot()
 
 	// As a workaround for Synology DSM6 not having a "var" directory, use the
@@ -100,13 +106,15 @@ func (e *extension) getCertStore(b *ipnlocal.LocalBackend) (certStore, error) {
 	if testX509Roots != nil && !testenv.InTest() {
 		panic("use of test hook outside of tests")
 	}
-	return certFileStore{dir: dir, testRoots: testX509Roots}, nil
+	return certFileStore{dir: dir, scope: b.DirectoryScope(), testRoots: testX509Roots}, nil
 }
 
 // certFileStore implements certStore by storing the cert & key files in
 // the named directory.
 type certFileStore struct {
 	dir string
+	// scope is captured at construction, never looked up by path.
+	scope *dirscope.Scope
 
 	// This field allows a test to override the CA root(s) for certificate
 	// verification. If nil the default system pool is used.
@@ -116,8 +124,13 @@ type certFileStore struct {
 const acmePEMName = "acme-account.key.pem"
 
 func (f certFileStore) ACMEKey() ([]byte, error) {
+	release, err := f.scope.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	pemName := filepath.Join(f.dir, acmePEMName)
-	v, err := os.ReadFile(pemName)
+	v, err := f.scope.ReadFile(pemName)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ipn.ErrStateNotExist
@@ -128,19 +141,29 @@ func (f certFileStore) ACMEKey() ([]byte, error) {
 }
 
 func (f certFileStore) WriteACMEKey(b []byte) error {
+	release, err := f.scope.Begin()
+	if err != nil {
+		return err
+	}
+	defer release()
 	pemName := filepath.Join(f.dir, acmePEMName)
-	return atomicfile.WriteFile(pemName, b, 0o600)
+	return f.scope.RecordWriteError(atomicfile.WriteFile(pemName, b, 0o600))
 }
 
 func (f certFileStore) Read(domain string, now time.Time) (*ipnlocal.TLSCertKeyPair, error) {
-	certPEM, err := os.ReadFile(certFile(f.dir, domain))
+	release, err := f.scope.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	certPEM, err := f.scope.ReadFile(certFile(f.dir, domain))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ipn.ErrStateNotExist
 		}
 		return nil, err
 	}
-	keyPEM, err := os.ReadFile(keyFile(f.dir, domain))
+	keyPEM, err := f.scope.ReadFile(keyFile(f.dir, domain))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ipn.ErrStateNotExist
@@ -154,18 +177,35 @@ func (f certFileStore) Read(domain string, now time.Time) (*ipnlocal.TLSCertKeyP
 }
 
 func (f certFileStore) WriteCert(domain string, cert []byte) error {
-	return atomicfile.WriteFile(certFile(f.dir, domain), cert, 0o644)
+	release, err := f.scope.Begin()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return f.scope.RecordWriteError(atomicfile.WriteFile(certFile(f.dir, domain), cert, 0o644))
 }
 
 func (f certFileStore) WriteKey(domain string, key []byte) error {
-	return atomicfile.WriteFile(keyFile(f.dir, domain), key, 0o600)
+	release, err := f.scope.Begin()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return f.scope.RecordWriteError(atomicfile.WriteFile(keyFile(f.dir, domain), key, 0o600))
 }
 
 func (f certFileStore) WriteTLSCertAndKey(domain string, cert, key []byte) error {
-	if err := f.WriteKey(domain, key); err != nil {
+	release, err := f.scope.Begin()
+	if err != nil {
 		return err
 	}
-	return f.WriteCert(domain, cert)
+	defer release()
+	// One admission covers both synchronous writes. Do not reacquire between
+	// them: an admitted operation may finish after its owner has sealed.
+	if err := f.scope.RecordWriteError(atomicfile.WriteFile(keyFile(f.dir, domain), key, 0o600)); err != nil {
+		return err
+	}
+	return f.scope.RecordWriteError(atomicfile.WriteFile(certFile(f.dir, domain), cert, 0o644))
 }
 
 // certStateStore implements certStore by storing the cert & key files

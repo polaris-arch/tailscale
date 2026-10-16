@@ -93,7 +93,7 @@ func (e *extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 	// netmapcache.Store's layout so a shared store could read these files if we consolidate later.
 	hexStoreKey := hex.EncodeToString([]byte(storeKey))
 	path := filepath.Join(varRoot, ipnlocal.ProfileDataDir, string(pid), storeKey, hexStoreKey)
-	st, err := store.NewFileStore(e.logf, path)
+	st, err := store.NewFileStoreWithScope(e.logf, path, e.sb.DirectoryScope())
 	if err != nil {
 		e.logf("building store for profile %q: %v", pid, err)
 		return

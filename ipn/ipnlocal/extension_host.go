@@ -593,7 +593,7 @@ func (h *ExtensionHost) shutdownWorkQueue() {
 	}
 	// Since callbacks are invoked synchronously, this will also wait
 	// for in-flight callbacks associated with those operations to finish.
-	if err := h.workQueue.Wait(ctx); err != nil {
+	if err := h.workQueue.ShutdownAndWait(ctx); err != nil {
 		h.logf("work queue shutdown failed: %v", err)
 	}
 }
@@ -643,4 +643,5 @@ type execQueue interface {
 	Add(func())
 	Shutdown()
 	Wait(context.Context) error
+	ShutdownAndWait(context.Context) error
 }

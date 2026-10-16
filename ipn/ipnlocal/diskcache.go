@@ -78,7 +78,7 @@ func (b *LocalBackend) ensureDiskCacheLocked() error {
 		return err
 	}
 	if c := b.diskCache; c.cache == nil || c.dir != dir {
-		b.diskCache.cache = netmapcache.NewCache(netmapcache.FileStore(dir))
+		b.diskCache.cache = netmapcache.NewCache(netmapcache.WithDirectoryScope(netmapcache.FileStore(dir), b.directoryScope))
 		b.diskCache.dir = dir
 	}
 	return nil
@@ -94,7 +94,7 @@ func (b *LocalBackend) loadDiskCacheLocked() (om *netmap.NetworkMap, ok bool) {
 		return nil, false
 	}
 	if c := b.diskCache; c.cache == nil || c.dir != dir {
-		b.diskCache.cache = netmapcache.NewCache(netmapcache.FileStore(dir))
+		b.diskCache.cache = netmapcache.NewCache(netmapcache.WithDirectoryScope(netmapcache.FileStore(dir), b.directoryScope))
 		b.diskCache.dir = dir
 	}
 	nm, err := b.diskCache.cache.Load(b.currentNode().Context())
@@ -116,7 +116,7 @@ func (b *LocalBackend) discardDiskCacheLocked() {
 	}
 	// Reaching here, we have a cache directory that needs to be purged.
 	// Log errors but do not fail for them.
-	store := netmapcache.FileStore(b.diskCache.dir)
+	store := netmapcache.WithDirectoryScope(netmapcache.FileStore(b.diskCache.dir), b.directoryScope)
 	if err := b.clearStoreLocked(b.currentNode().Context(), store); err != nil {
 		b.logf("clearing netmap cache: %v", err)
 	}
@@ -151,7 +151,7 @@ func (b *LocalBackend) ClearNetmapCache(ctx context.Context) error {
 
 	var errs []error
 	for _, p := range b.pm.Profiles() {
-		store := netmapcache.FileStore(b.profileDataPathLocked(p.ID(), "netmap-cache"))
+		store := netmapcache.WithDirectoryScope(netmapcache.FileStore(b.profileDataPathLocked(p.ID(), "netmap-cache")), b.directoryScope)
 		err := b.clearStoreLocked(ctx, store)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("clear netmap cache for profile %q: %w", p.ID(), err))

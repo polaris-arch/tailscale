@@ -6,6 +6,7 @@
 package ipnext
 
 import (
+	"github.com/sagernet/tailscale/util/dirscope"
 	"context"
 	"errors"
 	"fmt"
@@ -225,6 +226,8 @@ type SafeBackend interface {
 	Sys() *tsd.System
 	Clock() tstime.Clock
 	TailscaleVarRoot() string
+	// DirectoryScope is immutable and bound before extensions initialize.
+	DirectoryScope() *dirscope.Scope
 }
 
 // NotifyWatcher is a subset of [tailscale.com/ipn/ipnlocal.LocalBackend]

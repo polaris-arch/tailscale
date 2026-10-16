@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/tailscale/ipn/store/mem"
 	"github.com/sagernet/tailscale/paths"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/dirscope"
 	"github.com/sagernet/tailscale/util/mak"
 	"github.com/sagernet/tailscale/util/testenv"
 )
@@ -144,6 +145,8 @@ func TryWindowsAppDataMigration(logf logger.Logf, path string) string {
 // FileStore is a StateStore that uses a JSON file for persistence.
 type FileStore struct {
 	path string
+	// scope is immutable for the lifetime of this store. Nil preserves legacy behavior.
+	scope *dirscope.Scope
 
 	mu    sync.RWMutex
 	cache map[ipn.StateKey][]byte
@@ -156,12 +159,23 @@ func (s *FileStore) String() string { return fmt.Sprintf("FileStore(%q)", s.path
 
 // NewFileStore returns a new file store that persists to path.
 func NewFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
+	return NewFileStoreWithScope(logf, path, nil)
+}
+
+// NewFileStoreWithScope binds all file access to one immutable directory owner.
+// Admission covers directory creation, reads, and initialization writes.
+func NewFileStoreWithScope(logf logger.Logf, path string, scope *dirscope.Scope) (ipn.StateStore, error) {
+	release, err := scope.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	// We unconditionally call this to ensure that our perms are correct
 	if err := paths.MkStateDir(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("creating state directory: %w", err)
 	}
 
-	bs, err := os.ReadFile(path)
+	bs, err := scope.ReadFile(path)
 
 	// Treat an empty file as a missing file.
 	// (https://github.com/tailscale/tailscale/issues/895#issuecomment-723255589)
@@ -174,11 +188,12 @@ func NewFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
 		if os.IsNotExist(err) {
 			// Write out an initial file, to verify that we can write
 			// to the path.
-			if err = atomicfile.WriteFile(path, []byte("{}"), 0o600); err != nil {
+			if err = scope.RecordWriteError(atomicfile.WriteFile(path, []byte("{}"), 0o600)); err != nil {
 				return nil, err
 			}
 			return &FileStore{
 				path:  path,
+				scope: scope,
 				cache: map[ipn.StateKey][]byte{},
 			}, nil
 		}
@@ -187,6 +202,7 @@ func NewFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
 
 	ret := &FileStore{
 		path:  path,
+		scope: scope,
 		cache: map[ipn.StateKey][]byte{},
 	}
 	if err := json.Unmarshal(bs, &ret.cache); err != nil {
@@ -198,6 +214,11 @@ func NewFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
 
 // ReadState implements the StateStore interface.
 func (s *FileStore) ReadState(id ipn.StateKey) ([]byte, error) {
+	release, err := s.scope.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	bs, ok := s.cache[id]
@@ -209,6 +230,11 @@ func (s *FileStore) ReadState(id ipn.StateKey) ([]byte, error) {
 
 // WriteState implements the StateStore interface.
 func (s *FileStore) WriteState(id ipn.StateKey, bs []byte) error {
+	release, err := s.scope.Begin()
+	if err != nil {
+		return err
+	}
+	defer release()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if bytes.Equal(s.cache[id], bs) {
@@ -219,11 +245,11 @@ func (s *FileStore) WriteState(id ipn.StateKey, bs []byte) error {
 	} else {
 		s.cache[id] = bytes.Clone(bs)
 	}
-	bs, err := json.MarshalIndent(s.cache, "", "  ")
+	bs, err = json.MarshalIndent(s.cache, "", "  ")
 	if err != nil {
 		return err
 	}
-	return atomicfile.WriteFile(s.path, bs, 0o600)
+	return s.scope.RecordWriteError(atomicfile.WriteFile(s.path, bs, 0o600))
 }
 
 func (s *FileStore) All() iter.Seq2[ipn.StateKey, []byte] {

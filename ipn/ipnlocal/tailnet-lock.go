@@ -74,6 +74,9 @@ type tkaState struct {
 }
 
 func (b *LocalBackend) initTKALocked() error {
+	release, scopeErr := b.directoryScope.Begin()
+	if scopeErr != nil { return scopeErr }
+	defer release()
 	cp := b.pm.CurrentProfile()
 	if cp.ID() == "" {
 		b.tka = nil
@@ -97,7 +100,7 @@ func (b *LocalBackend) initTKALocked() error {
 	chonkDir := b.chonkPathLocked()
 	if _, err := os.Stat(chonkDir); err == nil {
 		// The directory exists, which means tailnet-lock has been initialized.
-		storage, err := tka.ChonkDir(chonkDir)
+		storage, err := tka.ChonkDirWithScope(chonkDir, b.directoryScope)
 		if err != nil {
 			return fmt.Errorf("opening tailchonk: %v", err)
 		}
@@ -557,7 +560,7 @@ func (b *LocalBackend) tkaBootstrapFromGenesisLocked(g tkatype.MarshaledAUM, per
 		storage = tka.ChonkMem()
 	} else {
 		chonkDir := b.chonkPathLocked()
-		chonk, err := tka.ChonkDir(chonkDir)
+		chonk, err := tka.ChonkDirWithScope(chonkDir, b.directoryScope)
 		if err != nil {
 			return fmt.Errorf("chonk: %v", err)
 		}

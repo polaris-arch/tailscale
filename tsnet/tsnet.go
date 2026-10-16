@@ -198,6 +198,7 @@ import (
 	"github.com/sagernet/tailscale/types/nettype"
 	"github.com/sagernet/tailscale/types/views"
 	"github.com/sagernet/tailscale/util/clientmetric"
+	"github.com/sagernet/tailscale/util/dirscope"
 	"github.com/sagernet/tailscale/util/mak"
 	"github.com/sagernet/tailscale/util/set"
 	"github.com/sagernet/tailscale/util/testenv"
@@ -222,6 +223,11 @@ type Server struct {
 	// "base" directory (such as your mutable storage folder) and
 	// then append the hostname on the end of it.
 	Dir string
+
+	// DirectoryScope binds filesystem access to one directory incarnation.
+	// Set before the first method call. Nil retains legacy behavior and
+	// cannot establish directory retirement.
+	DirectoryScope *dirscope.Scope
 
 	// Store specifies the state store to use.
 	//
@@ -338,6 +344,7 @@ type Server struct {
 	netstack            *netstack.Impl
 	netMon              *netmon.Monitor
 	rootPath            string // the state directory
+	directoryScope      *dirscope.Scope // immutable snapshot captured by start
 	hostname            string
 	shutdownCtx         context.Context
 	shutdownCancel      context.CancelFunc
@@ -349,6 +356,9 @@ type Server struct {
 	localAPIServer      *http.Server
 	resetServeStateOnce sync.Once
 	logbuffer           *filch.Filch
+	logbufferRelease    func() // held until actual filch Close returns
+	logbufferCloseOnce  sync.Once
+	logbufferCloseErr   error
 	logtail             *logtail.Logger
 	logid               logid.PublicID
 
@@ -643,9 +653,7 @@ func (s *Server) close() {
 		if s.logtail != nil {
 			s.logtail.Shutdown(ctx)
 		}
-		if s.logbuffer != nil {
-			s.logbuffer.Close()
-		}
+		s.closeLogBuffer()
 	})
 	wg.Go(func() {
 		if s.localAPIServer != nil {
@@ -776,6 +784,14 @@ func (s *Server) getAudience() string {
 }
 
 func (s *Server) start() (reterr error) {
+	s.directoryScope = s.DirectoryScope
+	release, err := s.directoryScope.Begin()
+	if err != nil {
+		return err
+	}
+	// Register first so error cleanup runs before this construction token
+	// is released. A failed start must not escape the directory owner.
+	defer release()
 	var closePool closeOnErrorPool
 	defer closePool.closeAllIfError(&reterr)
 
@@ -962,7 +978,12 @@ func (s *Server) start() (reterr error) {
 	if s.Store == nil {
 		stateFile := filepath.Join(s.rootPath, "tailscaled.state")
 		s.logf("tsnet running state path %s", stateFile)
-		s.Store, err = store.New(tsLogf, stateFile)
+		if s.directoryScope == nil {
+			// Preserve legacy provider/migration behavior without a scope.
+			s.Store, err = store.New(tsLogf, stateFile)
+		} else {
+			s.Store, err = store.NewFileStoreWithScope(tsLogf, stateFile, s.directoryScope)
+		}
 		if err != nil {
 			return err
 		}
@@ -973,7 +994,7 @@ func (s *Server) start() (reterr error) {
 	if s.Ephemeral {
 		loginFlags = controlclient.LoginEphemeral
 	}
-	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags|controlclient.LocalBackendStartKeyOSNeutral, s.LookupHook, s.OnlyTCP443)
+	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags|controlclient.LocalBackendStartKeyOSNeutral, s.LookupHook, s.OnlyTCP443, s.directoryScope)
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}
@@ -1104,11 +1125,15 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 		return nil
 	}
 	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
-	lpc, err := logpolicy.ConfigFromFile(cfgPath)
+	cfgBytes, err := s.directoryScope.ReadFile(cfgPath)
+	var lpc *logpolicy.Config
+	if err == nil {
+		lpc, err = logpolicy.ConfigFromBytes(cfgBytes)
+	}
 	switch {
 	case os.IsNotExist(err):
 		lpc = logpolicy.NewConfig(logtail.CollectionNode)
-		if err := lpc.Save(cfgPath); err != nil {
+		if err := s.directoryScope.RecordWriteError(lpc.Save(cfgPath)); err != nil {
 			return fmt.Errorf("logpolicy.Config.Save for %v: %w", cfgPath, err)
 		}
 	case err != nil:
@@ -1119,11 +1144,21 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 	}
 	s.logid = lpc.PublicID
 
+	// Filch can be written by escaped log callbacks until its Close. Keep a
+	// retained resource token, not merely the enclosing start token.
+	s.logbufferRelease, err = s.directoryScope.Begin()
+	if err != nil {
+		return err
+	}
 	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
 	if err != nil {
+		// New performs its own cleanup, whose errors are not separately
+		// exposed. Conservatively prevent positive retirement after failure.
+		s.directoryScope.Fail(err)
+		s.closeLogBuffer()
 		return fmt.Errorf("error creating filch: %w", err)
 	}
-	closePool.add(s.logbuffer)
+	closePool.addFunc(func() { s.closeLogBuffer() })
 	c := logtail.Config{
 		Collection:   lpc.Collection,
 		PrivateID:    lpc.PrivateID,
@@ -1141,6 +1176,24 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 	s.logtail = logtail.NewLogger(c, tsLogf)
 	closePool.addFunc(func() { s.logtail.Shutdown(context.Background()) })
 	return nil
+}
+
+// closeLogBuffer closes and releases the retained filch owner exactly once.
+// A close error poisons the original scope permanently; another Close cannot
+// replace it with a clean result. The token outlives the actual Close call.
+func (s *Server) closeLogBuffer() error {
+	s.logbufferCloseOnce.Do(func() {
+		if s.logbuffer != nil {
+			s.logbufferCloseErr = s.logbuffer.Close()
+			if s.logbufferCloseErr != nil {
+				s.directoryScope.Fail(s.logbufferCloseErr)
+			}
+		}
+		if s.logbufferRelease != nil {
+			s.logbufferRelease()
+		}
+	})
+	return s.logbufferCloseErr
 }
 
 type closeOnErrorPool []func()
@@ -2226,6 +2279,11 @@ func (s *Server) GetRootPath() string {
 // in this repository.
 // https://tailscale.com/docs/reference/troubleshooting/network-configuration/inspect-unencrypted-packets
 func (s *Server) CapturePcap(ctx context.Context, pcapFile string) error {
+	// The destination is caller-selected and the copy runs asynchronously.
+	// Scoped servers do not expose this unowned filesystem capability.
+	if s.directoryScope != nil || s.DirectoryScope != nil {
+		return errors.New("tsnet: CapturePcap is unavailable with a directory scope")
+	}
 	stream, err := s.localClient.StreamDebugCapture(ctx)
 	if err != nil {
 		return err

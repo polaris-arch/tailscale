@@ -940,7 +940,9 @@ func (c *Auto) Shutdown() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c.observerQueue.Wait(ctx)
+	if err := c.observerQueue.ShutdownAndWait(ctx); err != nil {
+		c.logf("client observer queue shutdown failed: %v", err)
+	}
 	c.logf("Client.Shutdown done.")
 }
 

@@ -6,6 +6,7 @@
 package tka
 
 import (
+	"github.com/sagernet/tailscale/util/dirscope"
 	"bytes"
 	"errors"
 	"fmt"
@@ -288,6 +289,7 @@ func (c *Mem) PurgeAUMs(hashes []AUMHash) error {
 //
 // FS implements the Chonk interface.
 type FS struct {
+	scope *dirscope.Scope
 	base string
 	mu   sync.RWMutex
 }
@@ -295,6 +297,14 @@ type FS struct {
 // ChonkDir returns an implementation of Chonk which uses the
 // given directory to store TKA state.
 func ChonkDir(dir string) (*FS, error) {
+	return ChonkDirWithScope(dir, nil)
+}
+
+// ChonkDirWithScope binds all filesystem operations before the first mkdir.
+func ChonkDirWithScope(dir string, scope *dirscope.Scope) (*FS, error) {
+	release, err := scope.Begin()
+	if err != nil { return nil, err }
+	defer release()
 	if err := os.MkdirAll(dir, 0o755); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("creating chonk root dir: %v", err)
 	}
@@ -311,7 +321,7 @@ func ChonkDir(dir string) (*FS, error) {
 	// delete them, to avoid data loss in the event of a bug.
 	// Implement deletion after we are fairly sure in the implementation.
 
-	return &FS{base: dir}, nil
+	return &FS{base: dir, scope: scope}, nil
 }
 
 // fsHashInfo describes how information about an AUMHash is represented
@@ -352,6 +362,9 @@ func (c *FS) aumDir(h AUMHash) (dir, base string) {
 //
 // If the AUM does not exist, then os.ErrNotExist is returned.
 func (c *FS) AUM(hash AUMHash) (AUM, error) {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return AUM{}, scopeErr }
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -372,6 +385,9 @@ func (c *FS) AUM(hash AUMHash) (AUM, error) {
 //
 // If the AUM does not exist, then os.ErrNotExist is returned.
 func (c *FS) CommitTime(h AUMHash) (time.Time, error) {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return time.Time{}, scopeErr }
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -403,6 +419,9 @@ func (c *FS) CommitTime(h AUMHash) (time.Time, error) {
 
 // AUM returns any known AUMs with a specific parent hash.
 func (c *FS) ChildAUMs(prevAUMHash AUMHash) ([]AUM, error) {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return nil, scopeErr }
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -423,7 +442,7 @@ func (c *FS) get(h AUMHash) (*fsHashInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { if err := f.Close(); err != nil { c.scope.Fail(err) } }()
 
 	m, err := cborDecOpts.DecMode()
 	if err != nil {
@@ -447,6 +466,9 @@ func (c *FS) get(h AUMHash) (*fsHashInfo, error) {
 // ChildAUMs(), so we haven't put any work into maintaining an index.
 // Instead, the full set of AUMs is scanned.
 func (c *FS) Heads() ([]AUM, error) {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return nil, scopeErr }
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -493,11 +515,17 @@ func (c *FS) Heads() ([]AUM, error) {
 
 // RemoveAll permanently and completely clears the TKA state.
 func (c *FS) RemoveAll() error {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return scopeErr }
+	defer release()
 	return os.RemoveAll(c.base)
 }
 
 // AllAUMs returns all AUMs stored in the chonk.
 func (c *FS) AllAUMs() ([]AUMHash, error) {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return nil, scopeErr }
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -511,7 +539,7 @@ func (c *FS) AllAUMs() ([]AUMHash, error) {
 }
 
 func (c *FS) scanHashes(eachHashInfo func(*fsHashInfo)) error {
-	prefixDirs, err := os.ReadDir(c.base)
+	prefixDirs, err := c.scope.ReadDir(c.base)
 	if err != nil {
 		return fmt.Errorf("reading prefix dirs: %v", err)
 	}
@@ -519,7 +547,7 @@ func (c *FS) scanHashes(eachHashInfo func(*fsHashInfo)) error {
 		if !prefix.IsDir() {
 			continue
 		}
-		files, err := os.ReadDir(filepath.Join(c.base, prefix.Name()))
+		files, err := c.scope.ReadDir(filepath.Join(c.base, prefix.Name()))
 		if err != nil {
 			return fmt.Errorf("reading prefix dir: %v", err)
 		}
@@ -555,9 +583,12 @@ func (c *FS) scanHashes(eachHashInfo func(*fsHashInfo)) error {
 // a hint on next startup to determine which chain to pick when computing
 // the current state, if there are multiple distinct chains.
 func (c *FS) SetLastActiveAncestor(hash AUMHash) error {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return scopeErr }
+	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return atomicfile.WriteFile(filepath.Join(c.base, "last_active_ancestor"), hash[:], 0o644)
+	return c.scope.RecordWriteError(atomicfile.WriteFile(filepath.Join(c.base, "last_active_ancestor"), hash[:], 0o644))
 }
 
 // LastActiveAncestor returns the oldest-known AUM that was (in a
@@ -567,10 +598,13 @@ func (c *FS) SetLastActiveAncestor(hash AUMHash) error {
 //
 // Nil is returned if no last-active ancestor is set.
 func (c *FS) LastActiveAncestor() (*AUMHash, error) {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return nil, scopeErr }
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	hash, err := os.ReadFile(filepath.Join(c.base, "last_active_ancestor"))
+	hash, err := c.scope.ReadFile(filepath.Join(c.base, "last_active_ancestor"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil // Not exist == none set.
@@ -591,6 +625,9 @@ func (c *FS) LastActiveAncestor() (*AUMHash, error) {
 // a call to aumVerify must return a nil error), as the
 // implementation assumes that only verified AUMs are stored.
 func (c *FS) CommitVerifiedAUMs(updates []AUM) error {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return scopeErr }
+	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -610,6 +647,9 @@ func (c *FS) CommitVerifiedAUMs(updates []AUM) error {
 
 // PurgeAUMs marks the specified AUMs for deletion from storage.
 func (c *FS) PurgeAUMs(hashes []AUMHash) error {
+	release, scopeErr := c.scope.Begin()
+	if scopeErr != nil { return scopeErr }
+	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -668,7 +708,7 @@ func (c *FS) commit(h AUMHash, updater func(*fsHashInfo)) error {
 	if err := m.NewEncoder(&buff).Encode(toCommit); err != nil {
 		return fmt.Errorf("encoding: %v", err)
 	}
-	return atomicfile.WriteFile(filepath.Join(dir, base), buff.Bytes(), 0o644)
+	return c.scope.RecordWriteError(atomicfile.WriteFile(filepath.Join(dir, base), buff.Bytes(), 0o644))
 }
 
 // CompactionOptions describes tuneables to use when compacting a Chonk.
